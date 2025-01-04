@@ -1,0 +1,43 @@
+version: '3.7'
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    hostname: rabbitmq
+    restart: always
+    ports:
+       - 5672:5672
+       - 15672:15672
+
+  features:
+    build:
+      context: ./features
+    restart: always
+    depends_on:
+      - rabbitmq
+
+  model:
+    build:
+      context: ./model
+    restart: always
+    depends_on:
+      - rabbitmq
+      - features
+
+  metric:
+    build:
+      context: ./metric
+    restart: always
+    depends_on:
+      - rabbitmq
+      - features
+      - model
+
+  plot:
+    build:
+      context: ./plot  # Путь к Dockerfile для plot сервиса
+    volumes:
+      - ./metric/logs:/usr/src/app/logs  # Связываем локальную директорию logs с директорией контейнера
+    restart: always
+    depends_on:
+      - metric  # Зависит от сервиса metric
