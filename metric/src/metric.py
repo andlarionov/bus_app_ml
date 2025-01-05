@@ -1,77 +1,76 @@
 import pika
 import json
 import pandas as pd
+import time
 import os
 
-# Создание папки logs, если она не существует
-os.makedirs('logs', exist_ok=True)
-
-# Запись заголовков в файл metric_log.csv
-log_file_path = 'logs/metric_log.csv'
-with open(log_file_path, 'w') as f:
-    f.write('id,y_true,y_pred,absolute_error\n')
+# Создаем директорию logs, если она не существует
+if not os.path.exists('./logs'):
+    os.makedirs('./logs')
 
 # Инициализация DataFrame для хранения метрик
-metrics_df = pd.DataFrame(columns=['id', 'y_true', 'y_pred'])
+metrics_df = pd.DataFrame(columns=['id', 'y_true', 'y_pred', 'absolute_error'])
 
-try:
-    # Создаём подключение к серверу на локальном хосте
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq'))
-    channel = connection.channel()
-   
-    # Объявляем очередь y_true
-    channel.queue_declare(queue='y_true')
-    # Объявляем очередь y_pred
-    channel.queue_declare(queue='y_pred')
+def connect_to_rabbitmq():
+    """Подключение к RabbitMQ с повторами в случае ошибки."""
+    while True:
+        try:
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host='rabbitmq', port=5672)
+            )
+            channel = connection.channel()
+            print("Подключение к RabbitMQ успешно установлено.")
+            return connection, channel
+        except pika.exceptions.AMQPConnectionError as e:
+            print(f"Не удалось подключиться к очереди: {e}. Повтор через 5 секунд.")
+            time.sleep(5)
 
-    # Функция для обработки сообщений из очереди y_true
-    def process_y_true(ch, method, properties, body):
-        global metrics_df
-        message = json.loads(body)
-        metrics_df = metrics_df.append({'id': message['id'], 'y_true': message['body']}, ignore_index=True)
-        calculate_absolute_error(message['id'])
-
-    # Функция для обработки сообщений из очереди y_pred
-    def process_y_pred(ch, method, properties, body):
-        global metrics_df
-        message = json.loads(body)
-        metrics_df.loc[metrics_df['id'] == message['id'], 'y_pred'] = message['body']
-        calculate_absolute_error(message['id'])
-
-    # Функция для вычисления абсолютной ошибки и записи в CSV
-    def calculate_absolute_error(message_id):
-        global metrics_df
-
-        if message_id in metrics_df['id'].values:
-            row = metrics_df[metrics_df['id'] == message_id]
-            if not row['y_true'].isnull().any() and not row['y_pred'].isnull().any():
-                y_true = row['y_true'].values[0]
-                y_pred = row['y_pred'].values[0]
-                absolute_error = abs(y_true - y_pred)
-
-                # Запись данных в CSV-файл
-                with open(log_file_path, 'a') as f:
-                    f.write(f'{message_id},{y_true},{y_pred},{absolute_error}\n')
-
-                # Удаление строки из DataFrame после записи (по желанию)
-                metrics_df.drop(metrics_df[metrics_df['id'] == message_id].index, inplace=True)
-
-    # Извлекаем сообщение из очереди y_true
-    channel.basic_consume(
-        queue='y_true',
-        on_message_callback=process_y_true,
-        auto_ack=True
-    )
+def calculate_absolute_error(message_id):
+    """Вычисляет абсолютную ошибку для заданного ID."""
+    global metrics_df
+    row = metrics_df[metrics_df['id'] == message_id]
     
-    # Извлекаем сообщение из очереди y_pred
-    channel.basic_consume(
-        queue='y_pred',
-        on_message_callback=process_y_pred,
-        auto_ack=True
-    )
+    if not row.empty and row['y_true'].notnull().any() and row['y_pred'].notnull().any():
+        absolute_error = abs(row['y_true'].values[0] - row['y_pred'].values[0])
+        metrics_df.loc[metrics_df['id'] == message_id, 'absolute_error'] = absolute_error
+        
+        # Записываем данные в CSV файл
+        metrics_df.to_csv('./logs/metric_log.csv', index=False)
 
-    # Запускаем режим ожидания прихода сообщений
-    print('...Ожидание сообщений, для выхода нажмите CTRL+C')
-    channel.start_consuming()
-except Exception as e:
-    print(f'Не удалось подключиться к очереди: {e}')
+def callback_y_true(ch, method, properties, body):
+    """Обработка сообщений из очереди y_true."""
+    global metrics_df
+    message = json.loads(body)
+    message_id = message['id']
+    y_true = message['body']
+    
+    metrics_df.loc[metrics_df.shape[0]] = [message_id, y_true, None, None]
+    
+    if not metrics_df[metrics_df['id'] == message_id]['y_pred'].isnull().all():
+        calculate_absolute_error(message_id)
+
+def callback_y_pred(ch, method, properties, body):
+    """Обработка сообщений из очереди y_pred."""
+    global metrics_df
+    message = json.loads(body)
+    message_id = message['id']
+    y_pred = message['body']
+    
+    metrics_df.loc[metrics_df.shape[0]] = [message_id, None, y_pred, None]
+    
+    if not metrics_df[metrics_df['id'] == message_id]['y_true'].isnull().all():
+        calculate_absolute_error(message_id)
+
+# Подключение к RabbitMQ
+connection, channel = connect_to_rabbitmq()
+
+# Объявление очередей
+channel.queue_declare(queue='y_true')
+channel.queue_declare(queue='y_pred')
+
+# Настройка обработки очередей
+channel.basic_consume(queue='y_true', on_message_callback=callback_y_true, auto_ack=True)
+channel.basic_consume(queue='y_pred', on_message_callback=callback_y_pred, auto_ack=True)
+
+print('...Ожидание сообщений')
+channel.start_consuming()
